@@ -89,6 +89,11 @@ cmake .. -DCMAKE_BUILD_TYPE=Release && make -j4
 ./auto_editor --input ../data/demo_3scenes.mp4 --output ../output/final_cut.mp4 \
   --model ../models/yolov8n.rknn --analysis-fps 6 --core-mask 1 \
   --report ../output/report.json
+
+# 调参/排查
+#   --dump-buckets        打印每个 1s 桶的显著性/画质/平滑分，用来解释为什么选中这一段
+#   --aes-weight 0.38     片段分里画质项权重（0.38 = 0.62 显著性 + 0.38 画质）
+#   --analysis-fps 6      检测采样率
 ```
 
 ## 已知限制

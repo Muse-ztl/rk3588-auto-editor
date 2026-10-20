@@ -34,6 +34,8 @@ struct Args {
   float conf = 0.30f;
   double analysis_fps = 6.0;
   int core_mask = 0;
+  bool dump_buckets = false;
+  double aes_weight = 0.38;
 };
 
 Args parse(int argc, char** argv) {
@@ -48,6 +50,8 @@ Args parse(int argc, char** argv) {
     else if (k == "--conf") a.conf = std::atof(next().c_str());
     else if (k == "--analysis-fps") a.analysis_fps = std::atof(next().c_str());
     else if (k == "--core-mask") a.core_mask = std::atoi(next().c_str());
+    else if (k == "--dump-buckets") a.dump_buckets = true;
+    else if (k == "--aes-weight") a.aes_weight = std::atof(next().c_str());
     else if (k == "-h" || k == "--help") {
       printf(
           "usage: auto_editor --input VID --output MP4 [--model yolov8n.rknn]\n"
@@ -76,6 +80,8 @@ double laplacian_var(const cv::Mat& gray) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // GMC 里的 RANSAC 用了全局随机数，固定种子保证同一素材多次运行结果一致
+  cv::setRNGSeed(0);
   const Args a = parse(argc, argv);
   std::filesystem::create_directories(
       std::filesystem::path(a.output).parent_path().string());
@@ -94,7 +100,8 @@ int main(int argc, char** argv) {
 
   ed::YoloV8 det(a.model, a.conf, 0.45f, 640, a.core_mask);
   ed::BoTSORT tracker;
-  ed::HighlightPicker picker(analysis_rate);
+  ed::HighlightPicker picker(analysis_rate, 1.0, 3.0, 8.0, 0.45, a.aes_weight);
+  picker.set_debug(a.dump_buckets);
 
   std::vector<double> detect_ms;
   long analyzed = 0, detect_calls = 0, reid_calls = 0, aes_calls = 0;

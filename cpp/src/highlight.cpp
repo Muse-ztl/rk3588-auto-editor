@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace ed {
 
@@ -86,13 +87,24 @@ std::vector<Segment> HighlightPicker::build_segments(double total_duration) cons
   }
 
   std::vector<double> raw, smooth;
-  for (size_t i = 0; i < buckets.size(); ++i) raw.push_back(0.62 * ratios[i] + 0.38 * aes[i]);
+  for (size_t i = 0; i < buckets.size(); ++i) raw.push_back((1.0 - aes_weight_) * ratios[i] + aes_weight_ * aes[i]);
   for (size_t i = 0; i < raw.size(); ++i) {
     const size_t lo = i == 0 ? 0 : i - 1;
     const size_t hi = std::min(raw.size(), i + 2);
     double s = 0.0;
     for (size_t k = lo; k < hi; ++k) s += raw[k];
     smooth.push_back(s / static_cast<double>(hi - lo));
+  }
+
+  if (debug_) {
+    printf("[buckets] %5s %6s %8s %6s %6s %7s\n", "sec", "frames", "prom", "ratio", "aes",
+           "smooth");
+    for (size_t i = 0; i < buckets.size(); ++i) {
+      printf("[buckets] %5d %6d %8.3f %6.3f %6.3f %7.3f\n", buckets[i],
+             bucket_frames_.at(buckets[i]),
+             bucket_prom_.count(buckets[i]) ? bucket_prom_.at(buckets[i]) : 0.0, ratios[i],
+             aes[i], smooth[i]);
+    }
   }
 
   const double win_len = std::max(min_clip_, std::min(max_clip_, total_duration * target_ratio_));
