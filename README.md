@@ -13,8 +13,6 @@
 
 整条链路不依赖云服务，素材不出设备。
 
-![demo frame](assets/cut_frame.jpg)
-
 ## 实测（Orange Pi 5 Pro / RK3588S）
 
 **A. 合成素材**（12s 960×540，三段硬切，切点 4.0s / 8.0s）
