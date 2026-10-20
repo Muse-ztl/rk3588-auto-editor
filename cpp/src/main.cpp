@@ -1,7 +1,10 @@
 // 端侧视频自动剪辑（C++）：分析 pass + 出片 pass。
 //
 //   ./auto_editor --input data/demo_3scenes.mp4 --output output/final_cut.mp4 \
-//                 --model models/yolov8n.rknn --analysis-fps 6 --report output/report.json
+//                 --model models/yolov8n.rknn --face-model models/yunet.onnx \
+//                 --pose-model models/yolov8n-pose.onnx --shot-model models/transnetv2.onnx
+//
+// 模型都是可选的：缺哪个就跳过哪个模块（切分退化为直方图），主流程不受影响。
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -19,7 +22,10 @@
 
 #include "aesthetics.h"
 #include "detector.h"
+#include "face.h"
 #include "highlight.h"
+#include "pose.h"
+#include "shot.h"
 #include "tracker.h"
 #include "types.h"
 #include "video_io.h"
@@ -30,12 +36,16 @@ struct Args {
   std::string input = "data/demo_3scenes.mp4";
   std::string output = "output/final_cut.mp4";
   std::string model = "models/yolov8n.rknn";
+  std::string face_model = "models/yunet.onnx";
+  std::string pose_model = "models/yolov8n-pose.onnx";
+  std::string shot_model = "models/transnetv2.onnx";
   std::string report;
   float conf = 0.30f;
   double analysis_fps = 6.0;
   int core_mask = 0;
   bool dump_buckets = false;
   double aes_weight = 0.38;
+  double shot_fps = 8.0;
 };
 
 Args parse(int argc, char** argv) {
@@ -46,16 +56,25 @@ Args parse(int argc, char** argv) {
     if (k == "--input") a.input = next();
     else if (k == "--output") a.output = next();
     else if (k == "--model") a.model = next();
+    else if (k == "--face-model") a.face_model = next();
+    else if (k == "--pose-model") a.pose_model = next();
+    else if (k == "--shot-model") a.shot_model = next();
     else if (k == "--report") a.report = next();
     else if (k == "--conf") a.conf = std::atof(next().c_str());
     else if (k == "--analysis-fps") a.analysis_fps = std::atof(next().c_str());
     else if (k == "--core-mask") a.core_mask = std::atoi(next().c_str());
     else if (k == "--dump-buckets") a.dump_buckets = true;
     else if (k == "--aes-weight") a.aes_weight = std::atof(next().c_str());
+    else if (k == "--shot-fps") a.shot_fps = std::atof(next().c_str());
     else if (k == "-h" || k == "--help") {
       printf(
-          "usage: auto_editor --input VID --output MP4 [--model yolov8n.rknn]\n"
-          "                   [--analysis-fps 6] [--conf 0.3] [--report out.json]\n");
+          "usage: auto_editor --input VID --output MP4 [options]\n"
+          "  --model yolov8n.rknn           检测（NPU）\n"
+          "  --face-model yunet.onnx        人脸（CPU，可选）\n"
+          "  --pose-model yolov8n-pose.onnx 姿态（CPU，可选）\n"
+          "  --shot-model transnetv2.onnx   镜头切分（CPU，可选；缺失退回直方图）\n"
+          "  --analysis-fps 6 --conf 0.3 --core-mask 0 --aes-weight 0.38\n"
+          "  --dump-buckets                 打印每秒打分\n");
       std::exit(0);
     }
   }
@@ -65,7 +84,8 @@ Args parse(int argc, char** argv) {
 double pct(std::vector<double> v, double p) {
   if (v.empty()) return 0.0;
   std::sort(v.begin(), v.end());
-  const size_t i = static_cast<size_t>(std::min(1.0, std::max(0.0, p / 100.0)) * (v.size() - 1));
+  const size_t i =
+      static_cast<size_t>(std::min(1.0, std::max(0.0, p / 100.0)) * (v.size() - 1));
   return v[i];
 }
 
@@ -94,17 +114,38 @@ int main(int argc, char** argv) {
   printf("[editor] %s  %.1fs  %dx%d @%.1ffps\n", a.input.c_str(), info.duration,
          info.width, info.height, info.fps);
 
-  const double stride_d = std::max(1.0, std::round(info.fps / std::max(1.0, a.analysis_fps)));
+  // ---- 模块初始化（人脸/姿态/切分缺失时自动降级）
+  ed::YoloV8 det(a.model, a.conf, 0.45f, 640, a.core_mask);
+  ed::BoTSORT tracker;
+  ed::FaceDetector face(a.face_model);
+  ed::PoseEstimator pose(a.pose_model);
+  ed::ShotDetector shot_model(a.shot_model);
+  printf("[modules] detect=rknn  face=%s  pose=%s  shot=%s\n",
+         face.ready() ? "yunet" : "off", pose.ready() ? "yolov8-pose" : "off",
+         shot_model.using_transnet() ? "transnetv2" : "histogram");
+
+  // ---- 镜头切分（预扫描）：边界用于约束选段，避免成片跨硬切
+  const double t_shot = static_cast<double>(cv::getTickCount());
+  const auto boundaries =
+      shot_model.detect(a.input, info.fps, info.width, info.height, a.shot_fps);
+  const double shot_sec =
+      (static_cast<double>(cv::getTickCount()) - t_shot) / cv::getTickFrequency();
+  printf("[shot] %zu boundaries in %.2fs:", boundaries.size(), shot_sec);
+  for (size_t i = 0; i < boundaries.size() && i < 12; ++i) printf(" %.2f", boundaries[i]);
+  printf("\n");
+
+  const double stride_d =
+      std::max(1.0, std::round(info.fps / std::max(1.0, a.analysis_fps)));
   const int stride = static_cast<int>(stride_d);
   const double analysis_rate = info.fps / stride;
 
-  ed::YoloV8 det(a.model, a.conf, 0.45f, 640, a.core_mask);
-  ed::BoTSORT tracker;
   ed::HighlightPicker picker(analysis_rate, 1.0, 3.0, 8.0, 0.45, a.aes_weight);
   picker.set_debug(a.dump_buckets);
+  picker.set_boundaries(boundaries);
 
-  std::vector<double> detect_ms;
-  long analyzed = 0, detect_calls = 0, reid_calls = 0, aes_calls = 0;
+  std::vector<double> detect_ms, face_ms, pose_ms;
+  long analyzed = 0, detect_calls = 0, reid_calls = 0, aes_calls = 0, face_calls = 0,
+       pose_calls = 0;
 
   const double t_start = static_cast<double>(cv::getTickCount());
   cv::VideoCapture cap(a.input);
@@ -129,6 +170,55 @@ int main(int argc, char** argv) {
     cv::Mat gray;
     cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
     auto tracks = tracker.update(boxes, feats, gray);
+
+    // 人脸：约 1fps，对画面上最大的 2 个人体框内做人脸检测（裁人再检测更稳）
+    if (face.ready() && idx % (stride * 6) == 0) {
+      const double tf = static_cast<double>(cv::getTickCount());
+      std::vector<const ed::Track*> persons;
+      for (const auto& tr : tracks) {
+        if (tr.cls == 0) persons.push_back(&tr);
+      }
+      std::sort(persons.begin(), persons.end(), [](const ed::Track* a, const ed::Track* b) {
+        const auto ra = a->kf.xyxy(), rb = b->kf.xyxy();
+        return ra.width * ra.height > rb.width * rb.height;
+      });
+      for (size_t k = 0; k < persons.size() && k < 2; ++k) {
+        const auto faces = face.detect_in_box(frame, persons[k]->kf.xyxy());
+        float best_frontal = -1.f;
+        for (const auto& f : faces) best_frontal = std::max(best_frontal, f.frontal);
+        if (a.dump_buckets) {
+          printf("[face] t=%.1fs tid=%d faces=%zu", t, persons[k]->tid, faces.size());
+          for (const auto& f : faces) printf(" score=%.2f frontal=%.2f", f.score, f.frontal);
+          printf("\n");
+        }
+        if (best_frontal >= 0.f) picker.add_face(t, persons[k]->tid, best_frontal);
+      }
+      face_ms.push_back((static_cast<double>(cv::getTickCount()) - tf) /
+                        cv::getTickFrequency() * 1000.0);
+      ++face_calls;
+    }
+
+    // 姿态：约 2fps，只对画面上最大的那个人跑（控制 CPU 开销）
+    if (pose.ready() && idx % (stride * 3) == 0) {
+      const ed::Track* biggest = nullptr;
+      float best_area = 0.f;
+      for (const auto& tr : tracks) {
+        if (tr.cls != 0) continue;
+        const auto r = tr.kf.xyxy();
+        if (r.width * r.height > best_area) {
+          best_area = r.width * r.height;
+          biggest = &tr;
+        }
+      }
+      if (biggest != nullptr) {
+        const double tp = static_cast<double>(cv::getTickCount());
+        const auto pr = pose.estimate(frame, biggest->kf.xyxy());
+        if (pr.ok) picker.add_framing(biggest->tid, pr.framing);
+        pose_ms.push_back((static_cast<double>(cv::getTickCount()) - tp) /
+                          cv::getTickFrequency() * 1000.0);
+        ++pose_calls;
+      }
+    }
 
     std::map<int, double> salience, sharpness;
     const int w = frame.cols, h = frame.rows;
@@ -197,7 +287,8 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < segments.size(); ++i) {
     std::ostringstream part;
     part << a.output << ".seg" << std::setw(2) << std::setfill('0') << i << ".mp4";
-    if (!ed::cut_segment(a.input, segments[i].start, segments[i].duration(), part.str(), enc, err)) {
+    if (!ed::cut_segment(a.input, segments[i].start, segments[i].duration(), part.str(), enc,
+                         err)) {
       fprintf(stderr, "cut failed: %s\n", err.c_str());
       return 1;
     }
@@ -215,20 +306,29 @@ int main(int argc, char** argv) {
   const double total = pass1 + pass2;
 
   printf("\n=== edit report ===\n");
-  printf("video          : %.1fs %dx%d @%.1ffps\n", info.duration, info.width, info.height, info.fps);
+  printf("video          : %.1fs %dx%d @%.1ffps\n", info.duration, info.width, info.height,
+         info.fps);
   printf("encode         : %s\n", enc.c_str());
   printf("detector       : rknn-npu  p50=%.1fms p90=%.1fms\n", pct(detect_ms, 50),
          pct(detect_ms, 90));
-  printf("analysis       : %ld frames @ %.1ffps, %.1fs (detect %ld, reid %ld, aesthetic %ld)\n",
+  if (!face_ms.empty())
+    printf("face (yunet)   : %ld calls, p50=%.1fms\n", face_calls, pct(face_ms, 50));
+  if (!pose_ms.empty())
+    printf("pose (yolov8)  : %ld calls, p50=%.1fms\n", pose_calls, pct(pose_ms, 50));
+  printf("shots          : %zu boundaries (%.2fs pre-pass)\n", boundaries.size(), shot_sec);
+  printf("analysis       : %ld frames @ %.1ffps, %.1fs (detect %ld, reid %ld, aes %ld)\n",
          analyzed, analysis_rate, pass1, detect_calls, reid_calls, aes_calls);
   if (protag) {
-    printf("protagonist    : tid=%d frames=%d score=%.3f salience=%.3f\n", protag->tid,
-           protag->frames, protag->protagonist_score(), protag->mean_salience());
+    printf("protagonist    : tid=%d frames=%d score=%.3f salience=%.3f face_hits=%d "
+           "framing=%.3f\n",
+           protag->tid, protag->frames, protag->protagonist_score(), protag->mean_salience(),
+           protag->face_hits, protag->mean_framing());
   }
   printf("segments       : ");
   for (const auto& s : segments) printf("(%.1f-%.1f %.2f) ", s.start, s.end, s.score);
   printf("\noutput         : %.1fs in %.1fs\n", out_info.duration, pass2);
-  printf("total          : %.1fs (%.2fx realtime)\n", total, info.duration / std::max(total, 1e-6));
+  printf("total          : %.1fs (%.2fx realtime)\n", total,
+         info.duration / std::max(total, 1e-6));
 
   if (!a.report.empty()) {
     std::ofstream rep(a.report);
@@ -238,20 +338,31 @@ int main(int argc, char** argv) {
         << "  \"video\": {\"width\": " << info.width << ", \"height\": " << info.height
         << ", \"fps\": " << info.fps << ", \"duration\": " << info.duration << "},\n"
         << "  \"encode_backend\": \"" << enc << "\",\n"
+        << "  \"modules\": {\"detect\": \"rknn\", \"face\": \""
+        << (face.ready() ? "yunet" : "off") << "\", \"pose\": \""
+        << (pose.ready() ? "yolov8-pose" : "off") << "\", \"shot\": \""
+        << (shot_model.using_transnet() ? "transnetv2" : "histogram") << "\"},\n"
+        << "  \"shots\": " << boundaries.size() << ",\n"
         << "  \"analysis_fps\": " << analysis_rate << ",\n"
         << "  \"analyzed_frames\": " << analyzed << ",\n"
         << "  \"detect_calls\": " << detect_calls << ",\n"
+        << "  \"face_calls\": " << face_calls << ",\n"
+        << "  \"pose_calls\": " << pose_calls << ",\n"
         << "  \"reid_calls\": " << reid_calls << ",\n"
         << "  \"aesthetic_calls\": " << aes_calls << ",\n"
         << "  \"detect_ms_p50\": " << pct(detect_ms, 50) << ",\n"
         << "  \"detect_ms_p90\": " << pct(detect_ms, 90) << ",\n"
+        << "  \"face_ms_p50\": " << pct(face_ms, 50) << ",\n"
+        << "  \"pose_ms_p50\": " << pct(pose_ms, 50) << ",\n"
         << "  \"pass1_seconds\": " << pass1 << ",\n"
         << "  \"pass2_seconds\": " << pass2 << ",\n"
         << "  \"output_duration\": " << out_info.duration << ",\n"
         << "  \"speedup_vs_realtime\": " << info.duration / std::max(total, 1e-6) << ",\n";
     if (protag) {
       rep << "  \"protagonist\": {\"track_id\": " << protag->tid << ", \"frames\": "
-          << protag->frames << ", \"score\": " << protag->protagonist_score() << "},\n";
+          << protag->frames << ", \"score\": " << protag->protagonist_score()
+          << ", \"face_hits\": " << protag->face_hits << ", \"framing\": "
+          << protag->mean_framing() << "},\n";
     }
     rep << "  \"segments\": [";
     for (size_t i = 0; i < segments.size(); ++i) {

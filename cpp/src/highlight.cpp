@@ -7,10 +7,29 @@
 namespace ed {
 
 double TrackStat::protagonist_score() const {
-  // 曝光时长 + 中心度 + 清晰度 + 正脸 + 置信度（与 Python 版一致）
-  return 0.34 * std::min(1.0, frames / 60.0) + 0.28 * mean_salience() +
-         0.20 * mean_sharp() + 0.10 * std::min(1.0, face_hits / 10.0) +
+  // 接入人脸/姿态后重新配权：正脸与构图各占一档
+  const double face_term = std::min(1.0, face_hits / 10.0) * (0.6 + 0.4 * mean_frontal());
+  return 0.30 * std::min(1.0, frames / 60.0) + 0.24 * mean_salience() +
+         0.16 * mean_sharp() + 0.12 * face_term + 0.10 * mean_framing() +
          0.08 * mean_score();
+}
+
+void HighlightPicker::add_face(double t, int tid, double frontal) {
+  const int bucket = static_cast<int>(t / seg_seconds_);
+  bucket_frontal_[bucket] = std::max(bucket_frontal_[bucket], frontal);
+
+  auto it = stats_.find(tid);
+  if (it == stats_.end()) return;
+  if (frontal < 0.5) return;  // 只统计"看得出是正脸"的帧
+  ++it->second.face_hits;
+  it->second.frontal_sum += frontal;
+}
+
+void HighlightPicker::add_framing(int tid, double framing) {
+  auto it = stats_.find(tid);
+  if (it == stats_.end()) return;
+  it->second.framing_sum += framing;
+  ++it->second.framing_frames;
 }
 
 void HighlightPicker::add_frame(double t, const std::vector<Track>& tracks,
@@ -87,7 +106,12 @@ std::vector<Segment> HighlightPicker::build_segments(double total_duration) cons
   }
 
   std::vector<double> raw, smooth;
-  for (size_t i = 0; i < buckets.size(); ++i) raw.push_back((1.0 - aes_weight_) * ratios[i] + aes_weight_ * aes[i]);
+  // 三项权重相加为 1：显著性为主，画质次之，正脸作为第三项证据（避免"没正脸=扣分"）
+  const double base_w = 1.0 - aes_weight_ - face_weight_;
+  for (size_t i = 0; i < buckets.size(); ++i) {
+    const double face = bucket_frontal_.count(buckets[i]) ? bucket_frontal_.at(buckets[i]) : 0.0;
+    raw.push_back(base_w * ratios[i] + aes_weight_ * aes[i] + face_weight_ * face);
+  }
   for (size_t i = 0; i < raw.size(); ++i) {
     const size_t lo = i == 0 ? 0 : i - 1;
     const size_t hi = std::min(raw.size(), i + 2);
@@ -111,23 +135,43 @@ std::vector<Segment> HighlightPicker::build_segments(double total_duration) cons
   const int win = std::max(1, static_cast<int>(std::round(win_len / seg_seconds_)));
   const int n = static_cast<int>(buckets.size());
 
-  std::vector<Segment> cands;
-  for (int i = 0; i < std::max(1, n - win + 1); ++i) {
-    const int end = std::min(n, i + win);
-    double sc = 0, pr = 0, ae = 0;
-    const int cnt = end - i;
-    for (int k = i; k < end; ++k) {
-      sc += smooth[k];
-      pr += ratios[k];
-      ae += aes[k];
+  // 候选窗口只在单个镜头内部滑：跨切点的话成片会从半个镜头开始
+  std::vector<std::pair<double, double>> shots;
+  {
+    double prev = 0.0;
+    for (double b : boundaries_) {
+      if (b - prev > 1.0) shots.emplace_back(prev, b);
+      prev = std::max(prev, b);
     }
-    Segment s;
-    s.start = buckets[i] * seg_seconds_;
-    s.end = std::min(total_duration, s.start + win * seg_seconds_);
-    s.score = sc / cnt;
-    s.protagonist_ratio = pr / cnt;
-    s.aesthetic = ae / cnt;
-    cands.push_back(s);
+    if (total_duration - prev > 1.0) shots.emplace_back(prev, total_duration);
+    if (shots.empty()) shots.emplace_back(0.0, total_duration);
+  }
+
+  std::vector<Segment> cands;
+  for (const auto& shot : shots) {
+    std::vector<int> idxs;
+    for (int i = 0; i < n; ++i) {
+      const double t0 = buckets[i] * seg_seconds_;
+      if (t0 >= shot.first - 1e-6 && t0 < shot.second - 1e-6) idxs.push_back(i);
+    }
+    if (idxs.size() < 2) continue;
+    const int w = std::min(win, static_cast<int>(idxs.size()));
+    for (int k = 0; k + w <= static_cast<int>(idxs.size()); ++k) {
+      const int i0 = idxs[k], i1 = idxs[k + w - 1];
+      double sc = 0, pr = 0, ae = 0;
+      for (int j = k; j < k + w; ++j) {
+        sc += smooth[idxs[j]];
+        pr += ratios[idxs[j]];
+        ae += aes[idxs[j]];
+      }
+      Segment seg;
+      seg.start = buckets[i0] * seg_seconds_;
+      seg.end = std::min(total_duration, (buckets[i1] + 1) * seg_seconds_);
+      seg.score = sc / w;
+      seg.protagonist_ratio = pr / w;
+      seg.aesthetic = ae / w;
+      cands.push_back(seg);
+    }
   }
   if (cands.empty()) return {};
 
@@ -139,20 +183,31 @@ std::vector<Segment> HighlightPicker::build_segments(double total_duration) cons
   });
 
   std::vector<Segment> chosen;
-  for (const auto& s : sorted) {
-    double used = 0.0;
-    for (const auto& c : chosen) used += c.duration();
-    if (used >= target) break;
-    if (used + s.duration() > budget) continue;
-    bool overlap = false;
-    for (const auto& c : chosen) {
-      if (s.start < c.end && c.start < s.end) {
-        overlap = true;
-        break;
-      }
+  auto crosses_boundary = [&](const Segment& s) {
+    for (double b : boundaries_) {
+      if (b > s.start + 0.15 && b < s.end - 0.15) return true;
     }
-    if (overlap) continue;
-    chosen.push_back(s);
+    return false;
+  };
+
+  // 两轮：先只选不跨镜头的窗口；一个都选不出来时才退让
+  for (int pass = 0; pass < 2 && chosen.empty(); ++pass) {
+    for (const auto& s : sorted) {
+      if (pass == 0 && crosses_boundary(s)) continue;
+      double used = 0.0;
+      for (const auto& c : chosen) used += c.duration();
+      if (used >= target) break;
+      if (used + s.duration() > budget) continue;
+      bool overlap = false;
+      for (const auto& c : chosen) {
+        if (s.start < c.end && c.start < s.end) {
+          overlap = true;
+          break;
+        }
+      }
+      if (overlap) continue;
+      chosen.push_back(s);
+    }
   }
   if (chosen.empty()) chosen.push_back(sorted.front());
 

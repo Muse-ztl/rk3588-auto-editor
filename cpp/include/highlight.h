@@ -17,11 +17,16 @@ struct TrackStat {
   double score_sum = 0.0;
   double salience_sum = 0.0;
   double sharp_sum = 0.0;
-  int face_hits = 0;
+  int face_hits = 0;          // 命中正脸（frontal > 0.6）的次数
+  double frontal_sum = 0.0;   // 每次命中的正脸程度累加
+  double framing_sum = 0.0;   // 姿态构图分累加
+  int framing_frames = 0;
 
   double mean_score() const { return score_sum / std::max(frames, 1); }
   double mean_salience() const { return salience_sum / std::max(frames, 1); }
   double mean_sharp() const { return sharp_sum / std::max(frames, 1); }
+  double mean_frontal() const { return face_hits ? frontal_sum / face_hits : 0.0; }
+  double mean_framing() const { return framing_frames ? framing_sum / framing_frames : 0.0; }
   double protagonist_score() const;
 };
 
@@ -41,7 +46,15 @@ class HighlightPicker {
                  const std::map<int, double>& salience,
                  const std::map<int, double>& sharpness, double aesthetic, bool has_aes);
 
+  // 人脸/姿态的逐 track 观测（在主循环里补充，打分时使用）
+  // t 用于把正脸证据记到对应秒上：硬切/转身都会导致 track id 重建，
+  // 按 id 记账会漏掉“换了 id 的同一个人”，按秒记账更稳。
+  void add_face(double t, int tid, double frontal);
+  void add_framing(int tid, double framing);
+
   void set_debug(bool on) { debug_ = on; }
+  // 镜头边界（秒）：选段窗口不跨越硬切点，避免成片从镜头中间开始
+  void set_boundaries(const std::vector<double>& b) { boundaries_ = b; }
   const TrackStat* choose_protagonist();
   std::vector<Segment> build_segments(double total_duration) const;
 
@@ -55,13 +68,16 @@ class HighlightPicker {
   double max_clip_;
   double target_ratio_;
   double aes_weight_;
+  double face_weight_ = 0.16;
 
   std::map<int, TrackStat> stats_;
   std::map<int, int> bucket_frames_;
   std::map<int, double> bucket_prom_;   // 该秒内人物的最大显著性
   std::map<int, std::pair<double, int>> bucket_aes_;
+  std::map<int, double> bucket_frontal_;
   int protag_tid_ = -1;
   bool debug_ = false;
+  std::vector<double> boundaries_;
 };
 
 }  // namespace ed
