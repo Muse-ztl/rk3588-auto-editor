@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.so
+build/
+output/
+.segments/
+.venv/
+venv/
+# 模型权重：体积大、且需要与板端 runtime 版本匹配，请用 scripts/ 重新导出
+models/*.rknn
+models/*.onnx
+*.rknn
+*.onnx
+*.pth
+# 演示素材（可由 scripts/make_demo_clip.py 重新生成）
+data/*.mp4
+data/*.avi

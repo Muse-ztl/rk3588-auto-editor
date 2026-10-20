@@ -1,0 +1,44 @@
+{
+  "input": "data/demo_3scenes.mp4",
+  "output": "output/final_cut.mp4",
+  "video": {
+    "path": "data/demo_3scenes.mp4",
+    "width": 960,
+    "height": 540,
+    "fps": 30.0,
+    "duration": 12.0,
+    "n_frames": 360,
+    "codec": "h264"
+  },
+  "decode_backend": "opencv-ffmpeg",
+  "encode_backend": "libx264",
+  "detector_backend": "rknn-npu",
+  "analysis_fps": 6.0,
+  "analyzed_frames": 72,
+  "detect_calls": 72,
+  "reid_calls": 36,
+  "aesthetic_calls": 6,
+  "detect_ms_p50": 112.3155880000013,
+  "detect_ms_p90": 120.10899949998475,
+  "pass1_seconds": 12.157749910000007,
+  "pass2_seconds": 0.8846981990000131,
+  "protagonist": {
+    "track_id": 2,
+    "class_id": 0,
+    "frames": 23,
+    "score": 0.5623,
+    "mean_center": 0.5744
+  },
+  "segments": [
+    {
+      "start": 7.0,
+      "end": 12.0,
+      "score": 0.9256652811039683,
+      "protagonist_ratio": 1.0,
+      "aesthetic": 0.8043823186946534,
+      "note": ""
+    }
+  ],
+  "output_duration": 5.0,
+  "speedup_vs_realtime": 0.9200726657842194
+}
