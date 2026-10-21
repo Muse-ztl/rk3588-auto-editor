@@ -1,6 +1,6 @@
 {
   "input": "data/user_material.mp4",
-  "model": "models/yolov8n_s255.rknn",
+  "model": "models/yolov8n.rknn",
   "core_mask": 1,
   "zero_copy": true,
   "runs": 200,
