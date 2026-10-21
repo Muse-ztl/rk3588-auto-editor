@@ -56,7 +56,7 @@
 
 | 用途 | 模型 | 位置 | 输入 |
 |---|---|---|---|
-| 检测 | YOLOv8n（9 输出 DFL 版） | RKNN / NPU | 640×640 letterbox |
+| 检测 | YOLOv8n（9 输出 DFL 版） | RKNN / NPU | 640×640 letterbox，FP16 或 INT8 |
 | 跟踪 | BoT-SORT（自实现） | CPU | 检测框 + HSV |
 | 切分 | TransNetV2 | ORT / CPU | 100×27×48×3 uint8，8fps |
 | 姿态 | YOLOv8n-pose | ORT / CPU | 640×640，17 关键点 |
@@ -64,16 +64,25 @@
 
 检测输出是 3 个尺度 × (box 64 / cls 80 / sum 1) 共 9 个张量，RKNN 返回的 layout 可能是 NCHW 也可能是 NHWC，代码里按维度判断，两种都支持。
 
+模型转换时把 `/255` 放进 RKNN 的 `std_values=255`，C++ 只做 letterbox + RGB。这样校准集读原图、
+线上推理也读原图，INT8 的输入分布才是同一个。
+
+检测器的 I/O 有两条路径：默认零拷贝（输入 FP16 + `pass_through`，输出 `rknn_set_io_mem`），
+失败时回退到 `rknn_inputs_set`/`rknn_outputs_get`。`--no-zero-copy` 可以强制走旧路径做 A/B。
+
 ## 测量
 
-- `--bench N`：只跑检测，前 3 次预热，输出 p50 / p95 / mean / fps，方便单独看检测性能。
+- `--bench N`：只跑检测，前 3 次预热，输出 p50 / p95 / 各阶段 p50，以及 RSS、CPU 占用、温度、NPU/CPU 频率。
+- `--bench-json PATH` 把结果落盘；`--dump-dets PATH` 导出最后一帧检测框，用来做逐位对比。
 - 完整跑：`--analysis-fps 6 --core-mask 1`，记录 pass1、pass2、各阶段调用次数。
 - 分位数是最近秩，取排序后 `floor(p/100 × (n-1))`，和历史 report 口径一致。
-- 同一段素材重复跑，检测 p50 会在 65～92ms 之间波动，和板子频率、温度、后台负载有关；README 里取的是一轮完整跑的数据，原始值在 `assets/`。
+- 同一段素材重复跑，检测 p50 会在 65～95ms 之间波动，和板子频率、温度、后台负载有关；
+  README 和 `docs/OPTIMIZATION.md` 里取的是同一轮完整跑/bench 的数据，原始值在 `assets/`。
 
 ## 没做 / 做得很糙
 
-- 没有 INT8 校准集，检测目前是 FP16；脚本支持 `--quantize`，但没有可复现的精度对比。
+- INT8 已经能跑（person recall 97.9%），但框抖动会让实拍素材的选段从 5–12s 偏到 4–11s，
+  所以默认仍用 FP16。要上线得先让跟踪器/选段对量化抖动更稳，或者做 QAT。
 - 外观特征是 HSV 直方图，不是 OSNet；换 ReID 模型只需要替换 `hsv_features`。
 - 姿态是 YOLOv8n-pose，不是 RTMPose。
 - 只支持单机位、无音频；成片音轨被丢掉。

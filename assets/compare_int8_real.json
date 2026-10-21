@@ -1,0 +1,11 @@
+{
+  "input": "data/user_material.mp4",
+  "ref_model": "models/yolov8n.rknn",
+  "test_model": "models/yolov8n_int8.rknn",
+  "zero_copy": false,
+  "frames": 100,
+  "ref_dets": 294, "test_dets": 284, "matched": 282,
+  "recall": 0.9592, "precision": 0.9930, "person_recall": 0.9791,
+  "mean_iou": 0.9809, "score_mae": 0.0243, "center_err_px": 1.5678,
+  "latency_ms": {"ref_p50": 95.5014, "test_p50": 51.6764}
+}

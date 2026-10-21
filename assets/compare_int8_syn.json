@@ -1,0 +1,11 @@
+{
+  "input": "data/demo_3scenes.mp4",
+  "ref_model": "models/yolov8n.rknn",
+  "test_model": "models/yolov8n_int8.rknn",
+  "zero_copy": false,
+  "frames": 100,
+  "ref_dets": 500, "test_dets": 500, "matched": 500,
+  "recall": 1.0000, "precision": 1.0000, "person_recall": 1.0000,
+  "mean_iou": 0.9652, "score_mae": 0.0230, "center_err_px": 8.5871,
+  "latency_ms": {"ref_p50": 121.6802, "test_p50": 53.5664}
+}

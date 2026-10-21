@@ -1,0 +1,11 @@
+{
+  "input": "data/user_material.mp4",
+  "model": "models/yolov8n_s255.rknn",
+  "core_mask": 1,
+  "zero_copy": false,
+  "runs": 200,
+  "detect_ms": {"p50": 91.65, "p95": 130.52, "mean": 96.20},
+  "stages_p50_ms": {"preprocess": 6.46, "input": 11.33, "npu_run": 56.83, "outputs_get": 11.56, "decode": 4.89, "nms": 0.03},
+  "system": {"rss_mb": 188.11, "hwm_mb": 188.11, "cpu_util_pct": 97.30, "temp_c": 42.54, "npu_mhz": 1000.00, "cpu_mhz": 600.00},
+  "last_dets": 2
+}
