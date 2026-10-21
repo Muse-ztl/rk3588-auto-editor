@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenCV
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopencv-dev
+
+      - name: Configure
+        run: >
+          cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Debug
+          -DED_BUILD_APP=OFF -DED_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build -j2
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure

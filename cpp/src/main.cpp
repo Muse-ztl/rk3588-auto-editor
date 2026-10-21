@@ -26,6 +26,7 @@
 #include "highlight.h"
 #include "pose.h"
 #include "shot.h"
+#include "stats.h"
 #include "tracker.h"
 #include "types.h"
 #include "video_io.h"
@@ -46,6 +47,7 @@ struct Args {
   bool dump_buckets = false;
   double aes_weight = 0.38;
   double shot_fps = 8.0;
+  int bench = 0;
 };
 
 Args parse(int argc, char** argv) {
@@ -66,6 +68,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--dump-buckets") a.dump_buckets = true;
     else if (k == "--aes-weight") a.aes_weight = std::atof(next().c_str());
     else if (k == "--shot-fps") a.shot_fps = std::atof(next().c_str());
+    else if (k == "--bench") a.bench = std::atoi(next().c_str());
     else if (k == "-h" || k == "--help") {
       printf(
           "usage: auto_editor --input VID --output MP4 [options]\n"
@@ -74,19 +77,12 @@ Args parse(int argc, char** argv) {
           "  --pose-model yolov8n-pose.onnx 姿态（CPU，可选）\n"
           "  --shot-model transnetv2.onnx   镜头切分（CPU，可选；缺失退回直方图）\n"
           "  --analysis-fps 6 --conf 0.3 --core-mask 0 --aes-weight 0.38\n"
-          "  --dump-buckets                 打印每秒打分\n");
+          "  --dump-buckets                 打印每秒打分\n"
+          "  --bench N                      只跑检测，输出 N 次延迟分位数\n");
       std::exit(0);
     }
   }
   return a;
-}
-
-double pct(std::vector<double> v, double p) {
-  if (v.empty()) return 0.0;
-  std::sort(v.begin(), v.end());
-  const size_t i =
-      static_cast<size_t>(std::min(1.0, std::max(0.0, p / 100.0)) * (v.size() - 1));
-  return v[i];
 }
 
 double laplacian_var(const cv::Mat& gray) {
@@ -97,20 +93,61 @@ double laplacian_var(const cv::Mat& gray) {
   return s.val[0] * s.val[0];
 }
 
+// 只跑检测：预热量、分位数、有效帧率。查"检测到底多快"比跑整条流水线省事。
+int run_bench(const Args& a, const ed::VideoInfo& info) {
+  ed::YoloV8 det(a.model, a.conf, 0.45f, 640, a.core_mask);
+  cv::VideoCapture cap(a.input);
+  if (!cap.isOpened()) {
+    fprintf(stderr, "cannot open video: %s\n", a.input.c_str());
+    return 1;
+  }
+
+  std::vector<double> ms;
+  cv::Mat frame;
+  int warmup = 3;
+  size_t last_dets = 0;
+  while (static_cast<int>(ms.size()) < a.bench) {
+    if (!cap.read(frame) || frame.empty()) {
+      cap.set(cv::CAP_PROP_POS_FRAMES, 0);
+      if (!cap.read(frame) || frame.empty()) break;  // 单帧视频，别死循环
+    }
+    auto dets = det.detect(frame);
+    last_dets = dets.size();
+    if (warmup > 0) {
+      --warmup;
+      continue;
+    }
+    ms.push_back(det.last_ms());
+  }
+
+  if (ms.empty()) {
+    fprintf(stderr, "bench got no frame\n");
+    return 1;
+  }
+  printf("[bench] %s  %dx%d @%.1ffps  %zu runs\n", a.input.c_str(), info.width, info.height,
+         info.fps, ms.size());
+  printf("[bench] detect p50=%.1fms p95=%.1fms mean=%.1fms  (%.1f fps)  last=%zu dets\n",
+         ed::percentile(ms, 50), ed::percentile(ms, 95), ed::mean(ms),
+         1000.0 / std::max(1e-6, ed::mean(ms)), last_dets);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   // GMC 里的 RANSAC 用了全局随机数，固定种子保证同一素材多次运行结果一致
   cv::setRNGSeed(0);
   const Args a = parse(argc, argv);
-  std::filesystem::create_directories(
-      std::filesystem::path(a.output).parent_path().string());
 
   const ed::VideoInfo info = ed::probe(a.input);
   if (info.width == 0) {
     fprintf(stderr, "cannot open video: %s\n", a.input.c_str());
     return 1;
   }
+  if (a.bench > 0) return run_bench(a, info);
+
+  const auto out_parent = std::filesystem::path(a.output).parent_path();
+  if (!out_parent.empty()) std::filesystem::create_directories(out_parent);
   printf("[editor] %s  %.1fs  %dx%d @%.1ffps\n", a.input.c_str(), info.duration,
          info.width, info.height, info.fps);
 
@@ -309,12 +346,14 @@ int main(int argc, char** argv) {
   printf("video          : %.1fs %dx%d @%.1ffps\n", info.duration, info.width, info.height,
          info.fps);
   printf("encode         : %s\n", enc.c_str());
-  printf("detector       : rknn-npu  p50=%.1fms p90=%.1fms\n", pct(detect_ms, 50),
-         pct(detect_ms, 90));
+  printf("detector       : rknn-npu  p50=%.1fms p95=%.1fms\n", ed::percentile(detect_ms, 50),
+         ed::percentile(detect_ms, 95));
   if (!face_ms.empty())
-    printf("face (yunet)   : %ld calls, p50=%.1fms\n", face_calls, pct(face_ms, 50));
+    printf("face (yunet)   : %ld calls, p50=%.1fms p95=%.1fms\n", face_calls,
+           ed::percentile(face_ms, 50), ed::percentile(face_ms, 95));
   if (!pose_ms.empty())
-    printf("pose (yolov8)  : %ld calls, p50=%.1fms\n", pose_calls, pct(pose_ms, 50));
+    printf("pose (yolov8)  : %ld calls, p50=%.1fms p95=%.1fms\n", pose_calls,
+           ed::percentile(pose_ms, 50), ed::percentile(pose_ms, 95));
   printf("shots          : %zu boundaries (%.2fs pre-pass)\n", boundaries.size(), shot_sec);
   printf("analysis       : %ld frames @ %.1ffps, %.1fs (detect %ld, reid %ld, aes %ld)\n",
          analyzed, analysis_rate, pass1, detect_calls, reid_calls, aes_calls);
@@ -350,10 +389,12 @@ int main(int argc, char** argv) {
         << "  \"pose_calls\": " << pose_calls << ",\n"
         << "  \"reid_calls\": " << reid_calls << ",\n"
         << "  \"aesthetic_calls\": " << aes_calls << ",\n"
-        << "  \"detect_ms_p50\": " << pct(detect_ms, 50) << ",\n"
-        << "  \"detect_ms_p90\": " << pct(detect_ms, 90) << ",\n"
-        << "  \"face_ms_p50\": " << pct(face_ms, 50) << ",\n"
-        << "  \"pose_ms_p50\": " << pct(pose_ms, 50) << ",\n"
+        << "  \"detect_ms_p50\": " << ed::percentile(detect_ms, 50) << ",\n"
+        << "  \"detect_ms_p95\": " << ed::percentile(detect_ms, 95) << ",\n"
+        << "  \"face_ms_p50\": " << ed::percentile(face_ms, 50) << ",\n"
+        << "  \"face_ms_p95\": " << ed::percentile(face_ms, 95) << ",\n"
+        << "  \"pose_ms_p50\": " << ed::percentile(pose_ms, 50) << ",\n"
+        << "  \"pose_ms_p95\": " << ed::percentile(pose_ms, 95) << ",\n"
         << "  \"pass1_seconds\": " << pass1 << ",\n"
         << "  \"pass2_seconds\": " << pass2 << ",\n"
         << "  \"output_duration\": " << out_info.duration << ",\n"

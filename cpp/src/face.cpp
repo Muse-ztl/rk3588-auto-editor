@@ -5,24 +5,18 @@
 #include <opencv2/imgproc.hpp>
 #include <onnxruntime_cxx_api.h>
 
+#include "frontal.h"
+
 namespace ed {
 namespace {
 
 constexpr int kInput = 640;  // 权重固定 640×640（也必须是 32 的倍数）
 
 // 五点几何判断正脸程度：侧脸时眼/鼻/嘴的对称性会明显破坏
-float frontal_score(const cv::Point2f pts[5]) {
-  const cv::Point2f eye_r = pts[0], eye_l = pts[1], nose = pts[2];
-  const cv::Point2f mouth_r = pts[3], mouth_l = pts[4];
-  const float eye_dx = std::abs(eye_l.x - eye_r.x);
-  if (eye_dx < 1e-3f) return 0.f;
-  const float eye_dy = std::abs(eye_l.y - eye_r.y) / eye_dx;
-  const float nose_mid = std::abs(nose.x - (eye_l.x + eye_r.x) * 0.5f) / eye_dx;
-  const float mouth_mid = std::abs((mouth_l.x + mouth_r.x) * 0.5f - nose.x) / eye_dx;
-  const float symmetry = 1.f - std::min(1.f, nose_mid * 2.f);
-  const float level = 1.f - std::min(1.f, eye_dy * 3.f);
-  const float mouth_ok = 1.f - std::min(1.f, mouth_mid * 2.f);
-  return std::clamp(0.45f * symmetry + 0.35f * level + 0.20f * mouth_ok, 0.f, 1.f);
+float frontal_from_landmarks(const cv::Point2f pts[5]) {
+  const float xy[10] = {pts[0].x, pts[0].y, pts[1].x, pts[1].y, pts[2].x,
+                        pts[2].y, pts[3].x, pts[3].y, pts[4].x, pts[4].y};
+  return frontal_score(xy);
 }
 
 float iou(const cv::Rect2f& a, const cv::Rect2f& b) {
@@ -141,7 +135,7 @@ std::vector<Face> FaceDetector::detect_in_box(const cv::Mat& frame,
               cv::Point2f(roi.x + (c + kps[idx * 10 + k * 2]) * s * inv_x,
                           roi.y + (r + kps[idx * 10 + k * 2 + 1]) * s * inv_y);
         }
-        f.frontal = frontal_score(f.landmarks);
+        f.frontal = frontal_from_landmarks(f.landmarks);
         cands.push_back(f);
       }
     }

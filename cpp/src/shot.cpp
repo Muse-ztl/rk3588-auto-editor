@@ -5,6 +5,8 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
+#include "shot_math.h"
+
 namespace ed {
 namespace {
 
@@ -79,14 +81,7 @@ std::vector<double> ShotDetector::detect_transnet(const std::vector<cv::Mat>& fr
     if (weight[i] > 0) prob[i] /= weight[i];
   }
   // 局部极大 + 阈值，避免一个切换点被检测成多帧
-  for (int i = 1; i + 1 < n; ++i) {
-    if (prob[i] < threshold_) continue;
-    if (prob[i] >= prob[i - 1] && prob[i] >= prob[i + 1]) {
-      boundaries.push_back(i / fps);
-      i += static_cast<int>(fps * 0.3);  // 300ms 内不重复
-    }
-  }
-  return boundaries;
+  return pick_shot_boundaries(prob, fps, threshold_);
 }
 
 std::vector<double> ShotDetector::detect_histogram(const std::string& video) {

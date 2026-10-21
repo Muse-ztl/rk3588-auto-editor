@@ -1,6 +1,7 @@
 // 主角识别 + 片段打分 + EDL 生成。
 #pragma once
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -40,7 +41,8 @@ class HighlightPicker {
         min_clip_(min_clip),
         max_clip_(max_clip),
         target_ratio_(target_ratio),
-        aes_weight_(aes_weight) {}
+        // 三项权重必须加起来等于 1，否则"加分项"会变成"扣分项"
+        aes_weight_(std::min(std::max(aes_weight, 0.0), 1.0 - face_weight_)) {}
 
   void add_frame(double t, const std::vector<Track>& tracks,
                  const std::map<int, double>& salience,
@@ -60,6 +62,8 @@ class HighlightPicker {
 
   int protagonist_tid() const { return protag_tid_; }
   const std::map<int, TrackStat>& stats() const { return stats_; }
+  double aes_weight() const { return aes_weight_; }
+  double face_weight() const { return face_weight_; }
 
  private:
   double fps_;
@@ -67,8 +71,8 @@ class HighlightPicker {
   double min_clip_;
   double max_clip_;
   double target_ratio_;
-  double aes_weight_;
   double face_weight_ = 0.16;
+  double aes_weight_;
 
   std::map<int, TrackStat> stats_;
   std::map<int, int> bucket_frames_;

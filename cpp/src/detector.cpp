@@ -10,6 +10,8 @@
 #include <opencv2/dnn.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "dfl.h"
+
 namespace ed {
 namespace {
 
@@ -117,59 +119,6 @@ void YoloV8::preprocess(const cv::Mat& bgr, std::vector<float>& out, float& rati
   }
 }
 
-float YoloV8::at(const float* p, int c, int y, int x, int H, int W, int C, bool chw) {
-  if (chw) return p[(static_cast<size_t>(c) * H + y) * W + x];
-  return p[(static_cast<size_t>(y) * W + x) * C + c];
-}
-
-void YoloV8::decode_scale(const std::vector<float>& box, const float* cls, int H, int W,
-                          int nc, float stride, std::vector<Box>& cands) const {
-  // box: (64) = 4 边 × 16 bins 的 DFL 分布；cls: (nc, H, W) 已过 sigmoid
-  const int bins = 16;
-  std::vector<float> dist(4, 0.f);
-  for (int y = 0; y < H; ++y) {
-    for (int x = 0; x < W; ++x) {
-      int best = -1;
-      float best_p = conf_;
-      for (int c = 0; c < nc; ++c) {
-        const float p = at(cls, c, y, x, H, W, nc, true);
-        if (p > best_p) {
-          best_p = p;
-          best = c;
-        }
-      }
-      if (best < 0) continue;
-
-      for (int side = 0; side < 4; ++side) {
-        float m = -1e9f;
-        float vals[bins];
-        for (int b = 0; b < bins; ++b) {
-          vals[b] = at(box.data(), side * bins + b, y, x, H, W, 64, true);
-          m = std::max(m, vals[b]);
-        }
-        float sum = 0.f, acc = 0.f;
-        for (int b = 0; b < bins; ++b) {
-          const float e = std::exp(vals[b] - m);
-          sum += e;
-          acc += e * b;
-        }
-        dist[side] = (sum > 0 ? acc / sum : 0.f) * stride;
-      }
-
-      const float cx = (x + 0.5f) * stride;
-      const float cy = (y + 0.5f) * stride;
-      Box b;
-      b.x1 = cx - dist[0];
-      b.y1 = cy - dist[1];
-      b.x2 = cx + dist[2];
-      b.y2 = cy + dist[3];
-      b.score = best_p;
-      b.cls = best;
-      cands.push_back(b);
-    }
-  }
-}
-
 std::vector<Box> YoloV8::nms(std::vector<Box>& cands, float ratio, float pad_x,
                              float pad_y) const {
   std::vector<Box> keep;
@@ -252,10 +201,10 @@ std::vector<Box> YoloV8::detect(const cv::Mat& bgr) {
     const int nc = static_cast<int>(ac.dims[chw ? 1 : 3]);
     const float stride = static_cast<float>(imgsz_) / H;
 
-    std::vector<float> box(outs[i].size / sizeof(float));
-    std::memcpy(box.data(), outs[i].buf, outs[i].size);
-    const auto* cls = static_cast<const float*>(outs[i + 1].buf);
-    decode_scale(box, cls, H, W, nc, stride, cands);
+    // box 和 cls 用同一种 layout：模型来自同一次导出，不会一半 CHW 一半 NHWC
+    decode_dfl_scale(static_cast<const float*>(outs[i].buf),
+                     static_cast<const float*>(outs[i + 1].buf), H, W, nc, 16, stride,
+                     conf_, chw, chw, cands);
   }
   rknn_outputs_release(ctx_, n_out_, outs.data());
 
