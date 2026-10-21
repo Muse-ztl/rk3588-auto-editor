@@ -27,6 +27,7 @@
 #include "pose.h"
 #include "shot.h"
 #include "stats.h"
+#include "sysinfo.h"
 #include "tracker.h"
 #include "types.h"
 #include "video_io.h"
@@ -48,6 +49,10 @@ struct Args {
   double aes_weight = 0.38;
   double shot_fps = 8.0;
   int bench = 0;
+  std::string bench_json;
+  std::string dump_dets;
+  std::string compare_model;
+  bool zero_copy = true;
 };
 
 Args parse(int argc, char** argv) {
@@ -69,6 +74,10 @@ Args parse(int argc, char** argv) {
     else if (k == "--aes-weight") a.aes_weight = std::atof(next().c_str());
     else if (k == "--shot-fps") a.shot_fps = std::atof(next().c_str());
     else if (k == "--bench") a.bench = std::atoi(next().c_str());
+    else if (k == "--bench-json") a.bench_json = next();
+    else if (k == "--dump-dets") a.dump_dets = next();
+    else if (k == "--compare-model") a.compare_model = next();
+    else if (k == "--no-zero-copy") a.zero_copy = false;
     else if (k == "-h" || k == "--help") {
       printf(
           "usage: auto_editor --input VID --output MP4 [options]\n"
@@ -78,7 +87,11 @@ Args parse(int argc, char** argv) {
           "  --shot-model transnetv2.onnx   镜头切分（CPU，可选；缺失退回直方图）\n"
           "  --analysis-fps 6 --conf 0.3 --core-mask 0 --aes-weight 0.38\n"
           "  --dump-buckets                 打印每秒打分\n"
-          "  --bench N                      只跑检测，输出 N 次延迟分位数\n");
+          "  --bench N                      只跑检测，输出 N 次延迟分位数\n"
+          "  --bench-json PATH              把 bench 结果写成 JSON\n"
+          "  --dump-dets PATH               把最后一帧检测结果写成 JSON\n"
+          "  --compare-model PATH           与 --model 逐帧对比（量化前后一致性）\n"
+          "  --no-zero-copy                 关闭 RKNN I/O 零拷贝，做 A/B 对比\n");
       std::exit(0);
     }
   }
@@ -93,9 +106,26 @@ double laplacian_var(const cv::Mat& gray) {
   return s.val[0] * s.val[0];
 }
 
+std::string json_escape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char ch : s) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += ch;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
 // 只跑检测：预热量、分位数、有效帧率。查"检测到底多快"比跑整条流水线省事。
 int run_bench(const Args& a, const ed::VideoInfo& info) {
-  ed::YoloV8 det(a.model, a.conf, 0.45f, 640, a.core_mask);
+  ed::YoloV8 det(a.model, a.conf, 0.45f, 640, a.core_mask, 100, a.zero_copy);
   cv::VideoCapture cap(a.input);
   if (!cap.isOpened()) {
     fprintf(stderr, "cannot open video: %s\n", a.input.c_str());
@@ -103,32 +133,207 @@ int run_bench(const Args& a, const ed::VideoInfo& info) {
   }
 
   std::vector<double> ms;
+  std::vector<ed::DetectTiming> timings;
+  std::vector<ed::Box> last_boxes;
   cv::Mat frame;
   int warmup = 3;
   size_t last_dets = 0;
+  const ed::SysSnapshot sys0 = ed::sys_snapshot();
+  const double wall0 = static_cast<double>(cv::getTickCount());
   while (static_cast<int>(ms.size()) < a.bench) {
     if (!cap.read(frame) || frame.empty()) {
       cap.set(cv::CAP_PROP_POS_FRAMES, 0);
       if (!cap.read(frame) || frame.empty()) break;  // 单帧视频，别死循环
     }
     auto dets = det.detect(frame);
+    last_boxes = dets;
     last_dets = dets.size();
     if (warmup > 0) {
       --warmup;
       continue;
     }
     ms.push_back(det.last_ms());
+    timings.push_back(det.timing());
   }
 
   if (ms.empty()) {
     fprintf(stderr, "bench got no frame\n");
     return 1;
   }
+  const double wall_s = (static_cast<double>(cv::getTickCount()) - wall0) / cv::getTickFrequency();
+  const ed::SysSnapshot sys1 = ed::sys_snapshot();
+  const double cpu_util = wall_s > 0.0 ? (sys1.cpu_ms - sys0.cpu_ms) / (wall_s * 1000.0) * 100.0 : 0.0;
+
+  auto stage = [&](double ed::DetectTiming::*field) {
+    std::vector<double> v;
+    v.reserve(timings.size());
+    for (const auto& t : timings) v.push_back(t.*field);
+    return ed::percentile(v, 50);
+  };
+
   printf("[bench] %s  %dx%d @%.1ffps  %zu runs\n", a.input.c_str(), info.width, info.height,
          info.fps, ms.size());
   printf("[bench] detect p50=%.1fms p95=%.1fms mean=%.1fms  (%.1f fps)  last=%zu dets\n",
          ed::percentile(ms, 50), ed::percentile(ms, 95), ed::mean(ms),
          1000.0 / std::max(1e-6, ed::mean(ms)), last_dets);
+  printf("[bench] stages p50: pre=%.1f input=%.1f npu=%.1f out=%.1f decode=%.1f nms=%.1f\n",
+         stage(&ed::DetectTiming::preprocess_ms), stage(&ed::DetectTiming::input_ms),
+         stage(&ed::DetectTiming::run_ms), stage(&ed::DetectTiming::output_ms),
+         stage(&ed::DetectTiming::decode_ms), stage(&ed::DetectTiming::nms_ms));
+  printf("[bench] system: rss=%.0fMB hwm=%.0fMB cpu=%.0f%% temp=%.1fC npu=%.0fMHz cpu=%.0fMHz\n",
+         sys1.rss_mb, sys1.hwm_mb, cpu_util, sys1.temp_c, sys1.npu_mhz, sys1.cpu_mhz);
+
+  if (!a.bench_json.empty()) {
+    std::ofstream rep(a.bench_json);
+    rep << std::fixed << std::setprecision(2)
+        << "{\n"
+        << "  \"input\": \"" << json_escape(a.input) << "\",\n"
+        << "  \"model\": \"" << json_escape(a.model) << "\",\n"
+        << "  \"core_mask\": " << a.core_mask << ",\n"
+        << "  \"zero_copy\": " << (det.zero_copy() ? "true" : "false") << ",\n"
+        << "  \"runs\": " << ms.size() << ",\n"
+        << "  \"detect_ms\": {\"p50\": " << ed::percentile(ms, 50)
+        << ", \"p95\": " << ed::percentile(ms, 95) << ", \"mean\": " << ed::mean(ms) << "},\n"
+        << "  \"stages_p50_ms\": {"
+        << "\"preprocess\": " << stage(&ed::DetectTiming::preprocess_ms)
+        << ", \"input\": " << stage(&ed::DetectTiming::input_ms)
+        << ", \"npu_run\": " << stage(&ed::DetectTiming::run_ms)
+        << ", \"outputs_get\": " << stage(&ed::DetectTiming::output_ms)
+        << ", \"decode\": " << stage(&ed::DetectTiming::decode_ms)
+        << ", \"nms\": " << stage(&ed::DetectTiming::nms_ms) << "},\n"
+        << "  \"system\": {\"rss_mb\": " << sys1.rss_mb << ", \"hwm_mb\": " << sys1.hwm_mb
+        << ", \"cpu_util_pct\": " << cpu_util << ", \"temp_c\": " << sys1.temp_c
+        << ", \"npu_mhz\": " << sys1.npu_mhz << ", \"cpu_mhz\": " << sys1.cpu_mhz << "},\n"
+        << "  \"last_dets\": " << last_dets << "\n"
+        << "}\n";
+  }
+  if (!a.dump_dets.empty()) {
+    std::ofstream d(a.dump_dets);
+    d << std::fixed << std::setprecision(4) << "[";
+    for (size_t i = 0; i < last_boxes.size(); ++i) {
+      const auto& b = last_boxes[i];
+      d << (i ? ", " : "") << "{\"x1\": " << b.x1 << ", \"y1\": " << b.y1
+        << ", \"x2\": " << b.x2 << ", \"y2\": " << b.y2 << ", \"score\": " << b.score
+        << ", \"cls\": " << b.cls << "}";
+    }
+    d << "]\n";
+  }
+  return 0;
+}
+
+float iou_box(const ed::Box& a, const ed::Box& b) {
+  const float x1 = std::max(a.x1, b.x1), y1 = std::max(a.y1, b.y1);
+  const float x2 = std::min(a.x2, b.x2), y2 = std::min(a.y2, b.y2);
+  const float inter = std::max(0.f, x2 - x1) * std::max(0.f, y2 - y1);
+  return inter / (a.area() + b.area() - inter + 1e-9f);
+}
+
+struct CompareStats {
+  long frames = 0;
+  long ref_n = 0, test_n = 0, matched = 0;
+  long ref_person = 0, test_person = 0, matched_person = 0;
+  double iou_sum = 0.0, score_abs = 0.0, center_err = 0.0;
+};
+
+// 没有标注数据时，用 FP16 当参考：同类别、IoU≥0.5 的贪心匹配。
+// 指标不是 mAP，只能说明"量化后框和分数变了多少"，写报告时要讲清楚。
+int run_compare(const Args& a, const ed::VideoInfo& info) {
+  ed::YoloV8 ref(a.model, a.conf, 0.45f, 640, a.core_mask, 100, a.zero_copy);
+  ed::YoloV8 q(a.compare_model, a.conf, 0.45f, 640, a.core_mask, 100, a.zero_copy);
+  cv::VideoCapture cap(a.input);
+  if (!cap.isOpened()) {
+    fprintf(stderr, "cannot open video: %s\n", a.input.c_str());
+    return 1;
+  }
+
+  CompareStats st;
+  std::vector<double> ref_ms, q_ms;
+  cv::Mat frame;
+  int warmup = 3;
+  while (st.frames < a.bench) {
+    if (!cap.read(frame) || frame.empty()) {
+      cap.set(cv::CAP_PROP_POS_FRAMES, 0);
+      if (!cap.read(frame) || frame.empty()) break;
+    }
+    const auto r = ref.detect(frame);
+    const auto t = q.detect(frame);
+    if (warmup > 0) {
+      --warmup;
+      continue;
+    }
+    ref_ms.push_back(ref.last_ms());
+    q_ms.push_back(q.last_ms());
+    ++st.frames;
+    st.ref_n += static_cast<long>(r.size());
+    st.test_n += static_cast<long>(t.size());
+
+    std::vector<char> used(t.size(), 0);
+    for (const auto& rb : r) {
+      float best_iou = 0.5f;
+      int best = -1;
+      for (size_t j = 0; j < t.size(); ++j) {
+        if (used[j] || t[j].cls != rb.cls) continue;
+        const float v = iou_box(rb, t[j]);
+        if (v >= best_iou) {
+          best_iou = v;
+          best = static_cast<int>(j);
+        }
+      }
+      if (rb.cls == 0) ++st.ref_person;
+      if (best < 0) continue;
+      used[best] = 1;
+      ++st.matched;
+      st.iou_sum += best_iou;
+      st.score_abs += std::abs(rb.score - t[best].score);
+      st.center_err += std::hypot((rb.cx() - t[best].cx()), (rb.cy() - t[best].cy()));
+      if (rb.cls == 0) ++st.matched_person;
+    }
+    for (const auto& tb : t)
+      if (tb.cls == 0) ++st.test_person;
+  }
+
+  if (st.frames == 0) {
+    fprintf(stderr, "compare got no frame\n");
+    return 1;
+  }
+  const double recall = st.ref_n ? static_cast<double>(st.matched) / st.ref_n : 0.0;
+  const double precision = st.test_n ? static_cast<double>(st.matched) / st.test_n : 0.0;
+  const double person_recall =
+      st.ref_person ? static_cast<double>(st.matched_person) / st.ref_person : 0.0;
+  const double mean_iou = st.matched ? st.iou_sum / st.matched : 0.0;
+  const double score_mae = st.matched ? st.score_abs / st.matched : 0.0;
+  const double center_err = st.matched ? st.center_err / st.matched : 0.0;
+
+  printf("[compare] %s  %dx%d @%.1ffps  %ld frames\n", a.input.c_str(), info.width, info.height,
+         info.fps, st.frames);
+  printf("[compare] ref=%s\ntest=%s\n", a.model.c_str(), a.compare_model.c_str());
+  printf("[compare] dets ref=%ld test=%ld matched=%ld recall=%.3f precision=%.3f mean_iou=%.3f\n",
+         st.ref_n, st.test_n, st.matched, recall, precision, mean_iou);
+  printf("[compare] person ref=%ld test=%ld matched=%ld recall=%.3f\n", st.ref_person,
+         st.test_person, st.matched_person, person_recall);
+  printf("[compare] score_mae=%.4f center_err_px=%.2f\n", score_mae, center_err);
+  printf("[compare] latency ref p50=%.1fms test p50=%.1fms\n", ed::percentile(ref_ms, 50),
+         ed::percentile(q_ms, 50));
+
+  if (!a.bench_json.empty()) {
+    std::ofstream rep(a.bench_json);
+    rep << std::fixed << std::setprecision(4)
+        << "{\n"
+        << "  \"input\": \"" << json_escape(a.input) << "\",\n"
+        << "  \"ref_model\": \"" << json_escape(a.model) << "\",\n"
+        << "  \"test_model\": \"" << json_escape(a.compare_model) << "\",\n"
+        << "  \"zero_copy\": " << (ref.zero_copy() ? "true" : "false") << ",\n"
+        << "  \"frames\": " << st.frames << ",\n"
+        << "  \"ref_dets\": " << st.ref_n << ", \"test_dets\": " << st.test_n
+        << ", \"matched\": " << st.matched << ",\n"
+        << "  \"recall\": " << recall << ", \"precision\": " << precision
+        << ", \"person_recall\": " << person_recall << ",\n"
+        << "  \"mean_iou\": " << mean_iou << ", \"score_mae\": " << score_mae
+        << ", \"center_err_px\": " << center_err << ",\n"
+        << "  \"latency_ms\": {\"ref_p50\": " << ed::percentile(ref_ms, 50)
+        << ", \"test_p50\": " << ed::percentile(q_ms, 50) << "}\n"
+        << "}\n";
+  }
   return 0;
 }
 
@@ -144,7 +349,9 @@ int main(int argc, char** argv) {
     fprintf(stderr, "cannot open video: %s\n", a.input.c_str());
     return 1;
   }
-  if (a.bench > 0) return run_bench(a, info);
+  if (a.bench > 0) {
+    return a.compare_model.empty() ? run_bench(a, info) : run_compare(a, info);
+  }
 
   const auto out_parent = std::filesystem::path(a.output).parent_path();
   if (!out_parent.empty()) std::filesystem::create_directories(out_parent);
@@ -152,7 +359,7 @@ int main(int argc, char** argv) {
          info.width, info.height, info.fps);
 
   // ---- 模块初始化（人脸/姿态/切分缺失时自动降级）
-  ed::YoloV8 det(a.model, a.conf, 0.45f, 640, a.core_mask);
+  ed::YoloV8 det(a.model, a.conf, 0.45f, 640, a.core_mask, 100, a.zero_copy);
   ed::BoTSORT tracker;
   ed::FaceDetector face(a.face_model);
   ed::PoseEstimator pose(a.pose_model);
@@ -341,6 +548,7 @@ int main(int argc, char** argv) {
 
   const auto out_info = ed::probe(a.output);
   const double total = pass1 + pass2;
+  const ed::SysSnapshot sys_end = ed::sys_snapshot();
 
   printf("\n=== edit report ===\n");
   printf("video          : %.1fs %dx%d @%.1ffps\n", info.duration, info.width, info.height,
@@ -377,6 +585,8 @@ int main(int argc, char** argv) {
         << "  \"video\": {\"width\": " << info.width << ", \"height\": " << info.height
         << ", \"fps\": " << info.fps << ", \"duration\": " << info.duration << "},\n"
         << "  \"encode_backend\": \"" << enc << "\",\n"
+        << "  \"model\": \"" << json_escape(a.model) << "\",\n"
+        << "  \"zero_copy\": " << (det.zero_copy() ? "true" : "false") << ",\n"
         << "  \"modules\": {\"detect\": \"rknn\", \"face\": \""
         << (face.ready() ? "yunet" : "off") << "\", \"pose\": \""
         << (pose.ready() ? "yolov8-pose" : "off") << "\", \"shot\": \""
@@ -398,7 +608,10 @@ int main(int argc, char** argv) {
         << "  \"pass1_seconds\": " << pass1 << ",\n"
         << "  \"pass2_seconds\": " << pass2 << ",\n"
         << "  \"output_duration\": " << out_info.duration << ",\n"
-        << "  \"speedup_vs_realtime\": " << info.duration / std::max(total, 1e-6) << ",\n";
+        << "  \"speedup_vs_realtime\": " << info.duration / std::max(total, 1e-6) << ",\n"
+        << "  \"process\": {\"rss_mb\": " << sys_end.rss_mb << ", \"hwm_mb\": " << sys_end.hwm_mb
+        << ", \"cpu_total_ms\": " << sys_end.cpu_ms << ", \"temp_c\": " << sys_end.temp_c
+        << ", \"npu_mhz\": " << sys_end.npu_mhz << "},\n";
     if (protag) {
       rep << "  \"protagonist\": {\"track_id\": " << protag->tid << ", \"frames\": "
           << protag->frames << ", \"score\": " << protag->protagonist_score()
